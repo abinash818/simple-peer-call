@@ -1,0 +1,194 @@
+<!DOCTYPE html>
+<html lang="ta">
+<head>
+  <meta charset="UTF-8" />
+  <title>Simple-Peer Video Call</title>
+  <style>
+    body {
+      font-family: sans-serif;
+      max-width: 800px;
+      margin: 0 auto;
+      padding: 16px;
+    }
+    video {
+      width: 48%;
+      border: 1px solid #ccc;
+      margin-top: 10px;
+    }
+    #localVideo {
+      transform: scaleX(-1);
+    }
+    .row {
+      margin: 8px 0;
+    }
+    input {
+      padding: 4px 8px;
+      margin-right: 8px;
+    }
+    button {
+      padding: 4px 10px;
+    }
+    #mySocketId {
+      font-weight: bold;
+    }
+  </style>
+</head>
+<body>
+  <h1>Simple-Peer Video Call (P2P)</h1>
+
+  <div class="row">
+    <span>My Socket ID: </span>
+    <span id="mySocketId">(connecting...)</span>
+  </div>
+
+  <div class="row">
+    <label>My Name / ID:
+      <input id="myId" placeholder="உங்கள் பெயர் / ID" />
+    </label>
+    <button id="registerBtn">Register</button>
+  </div>
+
+  <div class="row">
+    <label>Call To Socket ID:
+      <input id="targetId" placeholder="இரண்டாவது device socket ID" />
+    </label>
+    <button id="callBtn">Call</button>
+    <button id="endBtn">End Call</button>
+  </div>
+
+  <div class="row">
+    <video id="localVideo" autoplay muted playsinline></video>
+    <video id="remoteVideo" autoplay playsinline></video>
+  </div>
+
+  <!-- Socket.IO client script (serverலிருந்து வருது) -->
+  <script src="/socket.io/socket.io.js"></script>
+  <!-- simple-peer CDN -->
+  <script src="https://unpkg.com/simple-peer/simplepeer.min.js"></script>
+
+  <script>
+    const socket = io();
+
+    const mySocketIdSpan = document.getElementById('mySocketId');
+    const myIdInput = document.getElementById('myId');
+    const registerBtn = document.getElementById('registerBtn');
+    const targetIdInput = document.getElementById('targetId');
+    const callBtn = document.getElementById('callBtn');
+    const endBtn = document.getElementById('endBtn');
+
+    const localVideo = document.getElementById('localVideo');
+    const remoteVideo = document.getElementById('remoteVideo');
+
+    let peer = null;
+    let localStream = null;
+    let currentRemoteSocketId = null;
+
+    // Socket connected
+    socket.on('connect', () => {
+      mySocketIdSpan.textContent = socket.id;
+      console.log('Connected with socket ID:', socket.id);
+    });
+
+    // Register (optional)
+    registerBtn.onclick = () => {
+      const myId = myIdInput.value.trim();
+      if (!myId) {
+        alert('உங்கள் ID எழுதுங்கள்');
+        return;
+      }
+      socket.emit('register', myId);
+    };
+
+    // Start call button
+    callBtn.onclick = async () => {
+      const target = targetIdInput.value.trim();
+      if (!target) {
+        alert('Target socket ID தேவை');
+        return;
+      }
+      currentRemoteSocketId = target;
+      await startPeer(true, target); // initiator = true
+      socket.emit('call-user', { to: target });
+    };
+
+    // End call
+    endBtn.onclick = () => {
+      if (peer) {
+        peer.destroy();
+        peer = null;
+      }
+      if (remoteVideo.srcObject) {
+        remoteVideo.srcObject.getTracks().forEach(t => t.stop());
+        remoteVideo.srcObject = null;
+      }
+      console.log('Call ended');
+    };
+
+    // Incoming call
+    socket.on('incoming-call', async ({ from }) => {
+      const accept = confirm('Call from ' + from + ' – accept?');
+      if (!accept) return;
+      currentRemoteSocketId = from;
+      await startPeer(false, from); // initiator = false
+    });
+
+    // Signaling data receive
+    socket.on('signal', async ({ from, signal }) => {
+      if (!peer) {
+        // Safety: call start ஆகாத நேரமே signal வந்தால்
+        currentRemoteSocketId = from;
+        await startPeer(false, from);
+      }
+      peer.signal(signal);
+    });
+
+    async function startPeer(initiator, remoteSocketId) {
+      try {
+        if (!localStream) {
+          localStream = await navigator.mediaDevices.getUserMedia({
+            video: true,
+            audio: true,
+          });
+          localVideo.srcObject = localStream;
+        }
+      } catch (err) {
+        console.error('getUserMedia error', err);
+        alert('Camera / Mic access இல்லை / block ஆகியிருக்கும்.');
+        return;
+      }
+
+      if (peer) {
+        peer.destroy();
+        peer = null;
+      }
+
+      peer = new SimplePeer({
+        initiator,
+        trickle: false,
+        stream: localStream,
+      });
+
+      peer.on('signal', (data) => {
+        if (!remoteSocketId) return;
+        socket.emit('signal', {
+          to: remoteSocketId,
+          signal: data,
+        });
+      });
+
+      peer.on('stream', (remoteStream) => {
+        console.log('Remote stream received');
+        remoteVideo.srcObject = remoteStream;
+      });
+
+      peer.on('error', (err) => {
+        console.error('Peer error:', err);
+      });
+
+      peer.on('close', () => {
+        console.log('Peer connection closed');
+      });
+    }
+  </script>
+</body>
+</html>
