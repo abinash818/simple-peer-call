@@ -4,20 +4,47 @@ const http = require('http');
 const { Server } = require('socket.io');
 const path = require('path');
 const crypto = require('crypto');
+const multer = require('multer');
 
 const app = express();
 const server = http.createServer(app);
 const io = new Server(server);
 
-// Static files
+// ===== File upload setup =====
+const uploadDir = path.join(__dirname, 'uploads');
+const upload = multer({ dest: uploadDir });
+
+// static serve for uploads
+app.use('/uploads', express.static(uploadDir));
+
+// HTTP upload endpoint
+app.post('/upload', upload.single('file'), (req, res) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({ ok: false, error: 'No file' });
+    }
+    const fileUrl = '/uploads/' + req.file.filename;
+    return res.json({
+      ok: true,
+      url: fileUrl,
+      originalName: req.file.originalname,
+      mimeType: req.file.mimetype,
+    });
+  } catch (err) {
+    console.error('Upload error:', err);
+    return res.status(500).json({ ok: false, error: 'Upload failed' });
+  }
+});
+
+// ===== Static + basic route =====
 app.use(express.static(path.join(__dirname, 'public')));
 
-// Basic route
 app.get('/', (req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
 
-// In-memory data
+// ===== In-memory data =====
+
 // userId -> { name }
 const users = new Map();
 // userId -> socketId
@@ -52,11 +79,11 @@ function endSessionRecord(sessionId) {
   });
 }
 
-// SOCKET.IO
+// ===== Socket.IO =====
 io.on('connection', (socket) => {
   console.log('Socket connected:', socket.id);
 
-  // User registration
+  // --- Register user ---
   socket.on('register', (data, cb) => {
     try {
       const { name, existingUserId } = data || {};
@@ -84,17 +111,25 @@ io.on('connection', (socket) => {
     }
   });
 
-  // Session request (chat / audio / video)
+  // --- Session request (chat / audio / video) ---
   socket.on('request-session', (data, cb) => {
     try {
       const { toUserId, type } = data || {};
       const fromUserId = socketToUser.get(socket.id);
 
       if (!fromUserId) {
-        return cb({ ok: false, error: 'Not registered', code: 'not_registered' });
+        return cb({
+          ok: false,
+          error: 'Not registered',
+          code: 'not_registered',
+        });
       }
       if (!toUserId || !type) {
-        return cb({ ok: false, error: 'Missing fields', code: 'bad_request' });
+        return cb({
+          ok: false,
+          error: 'Missing fields',
+          code: 'bad_request',
+        });
       }
 
       const targetSocketId = userSockets.get(toUserId);
@@ -108,11 +143,8 @@ io.on('connection', (socket) => {
       }
 
       const sessionId = crypto.randomUUID();
-
-      // Session active record
       startSessionRecord(sessionId, type, fromUserId, toUserId);
 
-      // notify other user
       io.to(targetSocketId).emit('incoming-session', {
         sessionId,
         fromUserId,
@@ -130,7 +162,7 @@ io.on('connection', (socket) => {
     }
   });
 
-  // Callee accepts / rejects
+  // --- Answer session ---
   socket.on('answer-session', (data) => {
     try {
       const { sessionId, toUserId, type, accept } = data || {};
@@ -140,7 +172,6 @@ io.on('connection', (socket) => {
       const targetSocketId = userSockets.get(toUserId);
       if (!targetSocketId) return;
 
-      // rejectஆனா busy lock remove
       if (!accept) {
         endSessionRecord(sessionId);
       }
@@ -160,7 +191,7 @@ io.on('connection', (socket) => {
     }
   });
 
-  // WebRTC signaling relay
+  // --- WebRTC signaling relay ---
   socket.on('signal', (data) => {
     try {
       const { sessionId, toUserId, signal } = data || {};
@@ -180,35 +211,82 @@ io.on('connection', (socket) => {
     }
   });
 
-  // Chat message (Socket.IO)
+  // --- Chat message (text / audio / file) ---
+  // content: { type: 'text'|'audio'|'file', text?, url?, mimeType?, name? }
   socket.on('chat-message', (data) => {
     try {
-      const { toUserId, text, sessionId, timestamp } = data || {};
+      const { toUserId, sessionId, content, timestamp, messageId } = data || {};
       const fromUserId = socketToUser.get(socket.id);
-      if (!fromUserId || !toUserId || !text) return;
+      if (!fromUserId || !toUserId || !content || !messageId) return;
 
       const targetSocketId = userSockets.get(toUserId);
       if (!targetSocketId) return;
 
+      // sender-க்கு single tick => sent
+      socket.emit('message-status', {
+        messageId,
+        status: 'sent',
+      });
+
+      // receiver-க்கு message
       io.to(targetSocketId).emit('chat-message', {
         fromUserId,
-        text,
+        content,
         sessionId: sessionId || null,
         timestamp: timestamp || Date.now(),
+        messageId,
       });
     } catch (err) {
       console.error('chat-message error', err);
     }
   });
 
-  // Session end (duration logging)
+  // --- Receiver: delivered/seen ack ---
+  socket.on('message-delivered', (data) => {
+    try {
+      const { toUserId, messageId } = data || {};
+      const fromUserId = socketToUser.get(socket.id);
+      if (!fromUserId || !toUserId || !messageId) return;
+
+      const targetSocketId = userSockets.get(toUserId);
+      if (!targetSocketId) return;
+
+      // double tick => delivered/seen
+      io.to(targetSocketId).emit('message-status', {
+        messageId,
+        status: 'seen', // delivered/seen ஒன்றா வைத்திருக்கிறோம்
+      });
+    } catch (err) {
+      console.error('message-delivered error', err);
+    }
+  });
+
+  // --- Typing indicator ---
+  socket.on('typing', (data) => {
+    try {
+      const { toUserId, isTyping } = data || {};
+      const fromUserId = socketToUser.get(socket.id);
+      if (!fromUserId || !toUserId) return;
+
+      const targetSocketId = userSockets.get(toUserId);
+      if (!targetSocketId) return;
+
+      io.to(targetSocketId).emit('typing', {
+        fromUserId,
+        isTyping: !!isTyping,
+      });
+    } catch (err) {
+      console.error('typing error', err);
+    }
+  });
+
+  // --- Session end ---
   socket.on('session-ended', (data) => {
     try {
       const { sessionId, toUserId, type, durationMs } = data || {};
       const fromUserId = socketToUser.get(socket.id);
       if (!fromUserId || !sessionId || !toUserId) return;
 
-      // clear busy/both users
       endSessionRecord(sessionId);
 
       const targetSocketId = userSockets.get(toUserId);
@@ -234,8 +312,6 @@ io.on('connection', (socket) => {
     if (userId) {
       console.log(`Socket disconnected: ${socket.id}, userId=${userId}`);
       socketToUser.delete(socket.id);
-
-      // userஅவங்க sideல இருந்த active session இருந்தா unlock
       const sid = userActiveSession.get(userId);
       endSessionRecord(sid);
     } else {
