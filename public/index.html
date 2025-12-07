@@ -2,58 +2,87 @@
 <html lang="ta">
 <head>
   <meta charset="UTF-8" />
-  <title>Simple-Peer Video Call</title>
+  <title>P2P Chat / Audio / Video</title>
   <style>
     body {
       font-family: sans-serif;
-      max-width: 800px;
+      max-width: 900px;
       margin: 0 auto;
       padding: 16px;
     }
+    .row { margin: 8px 0; }
+    input, button {
+      padding: 6px 10px;
+      margin: 3px;
+    }
+    button { cursor: pointer; }
+    #myUserId {
+      font-weight: bold;
+      color: #1b5e20;
+    }
+    #status {
+      margin-top: 8px;
+      padding: 6px;
+      border: 1px solid #ccc;
+      min-height: 30px;
+      font-size: 14px;
+    }
+    #timer {
+      font-weight: bold;
+      color: #1565c0;
+    }
     video {
-      width: 48%;
+      width: 45%;
       border: 1px solid #ccc;
       margin-top: 10px;
     }
-    #localVideo {
-      transform: scaleX(-1);
+    #chatBox {
+      border: 1px solid #ccc;
+      padding: 8px;
+      height: 150px;
+      overflow-y: auto;
+      font-size: 14px;
+      margin-top: 8px;
     }
-    .row {
-      margin: 8px 0;
-    }
-    input {
-      padding: 4px 8px;
-      margin-right: 8px;
-    }
-    button {
-      padding: 4px 10px;
-    }
-    #mySocketId {
-      font-weight: bold;
-    }
+    .chat-me { color: #1b5e20; }
+    .chat-other { color: #b71c1c; }
   </style>
 </head>
 <body>
-  <h1>Simple-Peer Video Call (P2P)</h1>
+  <h2>P2P Chat / Audio / Video (Single Page)</h2>
 
   <div class="row">
-    <span>My Socket ID: </span>
-    <span id="mySocketId">(connecting...)</span>
-  </div>
-
-  <div class="row">
-    <label>My Name / ID:
-      <input id="myId" placeholder="உங்கள் பெயர் / ID" />
+    <label>உங்கள் பெயர்:
+      <input id="nameInput" placeholder="உங்கள் பெயர்" />
     </label>
     <button id="registerBtn">Register</button>
   </div>
 
   <div class="row">
-    <label>Call To Socket ID:
-      <input id="targetId" placeholder="இரண்டாவது device socket ID" />
-    </label>
-    <button id="callBtn">Call</button>
-    <button id="endBtn">End Call</button>
+    உங்கள் User ID:
+    <span id="myUserId">(register ஆகவில்லை)</span>
+  </div>
+
+  <div class="row">
+    Target User ID:
+    <input id="targetUserId" placeholder="மற்றவரின் User ID" />
+  </div>
+
+  <div class="row">
+    <button id="btnChat">Start Chat</button>
+    <button id="btnAudio">Start Audio Call</button>
+    <button id="btnVideo">Start Video Call</button>
+    <button id="btnEnd">End Session</button>
+  </div>
+
+  <div class="row">
+    Status:
+    <div id="status"></div>
+  </div>
+
+  <div class="row">
+    Session Timer:
+    <span id="timer">00:00</span>
   </div>
 
   <div class="row">
@@ -61,134 +90,403 @@
     <video id="remoteVideo" autoplay playsinline></video>
   </div>
 
-  <!-- Socket.IO client script (serverலிருந்து வருது) -->
+  <h3>Chat</h3>
+  <div id="chatBox"></div>
+  <div class="row">
+    <input id="chatInput" placeholder="செய்தி type செய்யுங்கள்" />
+    <button id="chatSendBtn">Send</button>
+  </div>
+
+  <!-- Socket.IO client -->
   <script src="/socket.io/socket.io.js"></script>
-  <!-- simple-peer CDN -->
+  <!-- Simple-peer -->
   <script src="https://unpkg.com/simple-peer/simplepeer.min.js"></script>
 
   <script>
     const socket = io();
-
-    const mySocketIdSpan = document.getElementById('mySocketId');
-    const myIdInput = document.getElementById('myId');
+    const nameInput = document.getElementById('nameInput');
     const registerBtn = document.getElementById('registerBtn');
-    const targetIdInput = document.getElementById('targetId');
-    const callBtn = document.getElementById('callBtn');
-    const endBtn = document.getElementById('endBtn');
+    const myUserIdSpan = document.getElementById('myUserId');
+    const targetUserIdInput = document.getElementById('targetUserId');
+
+    const btnChat = document.getElementById('btnChat');
+    const btnAudio = document.getElementById('btnAudio');
+    const btnVideo = document.getElementById('btnVideo');
+    const btnEnd = document.getElementById('btnEnd');
+
+    const statusDiv = document.getElementById('status');
+    const timerSpan = document.getElementById('timer');
 
     const localVideo = document.getElementById('localVideo');
     const remoteVideo = document.getElementById('remoteVideo');
 
+    const chatBox = document.getElementById('chatBox');
+    const chatInput = document.getElementById('chatInput');
+    const chatSendBtn = document.getElementById('chatSendBtn');
+
+    let myUserId = null;
+    let currentSession = null; // { id, type, partnerUserId, startTime, timerInterval }
     let peer = null;
     let localStream = null;
-    let currentRemoteSocketId = null;
 
-    // Socket connected
-    socket.on('connect', () => {
-      mySocketIdSpan.textContent = socket.id;
-      console.log('Connected with socket ID:', socket.id);
-    });
+    function setStatus(text) {
+      statusDiv.textContent = text;
+      console.log('[STATUS]', text);
+    }
 
-    // Register (optional)
-    registerBtn.onclick = () => {
-      const myId = myIdInput.value.trim();
-      if (!myId) {
-        alert('உங்கள் ID எழுதுங்கள்');
-        return;
+    function formatDuration(ms) {
+      const totalSeconds = Math.floor(ms / 1000);
+      const h = Math.floor(totalSeconds / 3600);
+      const m = Math.floor((totalSeconds % 3600) / 60);
+      const s = totalSeconds % 60;
+      if (h > 0) {
+        return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
       }
-      socket.emit('register', myId);
-    };
+      return `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
+    }
 
-    // Start call button
-    callBtn.onclick = async () => {
-      const target = targetIdInput.value.trim();
-      if (!target) {
-        alert('Target socket ID தேவை');
-        return;
+    function startTimer() {
+      if (!currentSession) return;
+      currentSession.startTime = Date.now();
+      timerSpan.textContent = '00:00';
+      if (currentSession.timerInterval) clearInterval(currentSession.timerInterval);
+      currentSession.timerInterval = setInterval(() => {
+        const now = Date.now();
+        const diff = now - currentSession.startTime;
+        timerSpan.textContent = formatDuration(diff);
+      }, 1000);
+    }
+
+    function stopTimerAndGetDuration() {
+      if (!currentSession) return 0;
+      if (currentSession.timerInterval) {
+        clearInterval(currentSession.timerInterval);
+        currentSession.timerInterval = null;
       }
-      currentRemoteSocketId = target;
-      await startPeer(true, target); // initiator = true
-      socket.emit('call-user', { to: target });
-    };
+      const end = Date.now();
+      const duration = end - (currentSession.startTime || end);
+      timerSpan.textContent = '00:00';
+      return duration;
+    }
 
-    // End call
-    endBtn.onclick = () => {
+    function resetMedia() {
       if (peer) {
         peer.destroy();
         peer = null;
       }
-      if (remoteVideo.srcObject) {
-        remoteVideo.srcObject.getTracks().forEach(t => t.stop());
-        remoteVideo.srcObject = null;
+      if (localStream) {
+        localStream.getTracks().forEach(t => t.stop());
+        localStream = null;
       }
-      console.log('Call ended');
-    };
+      localVideo.srcObject = null;
+      remoteVideo.srcObject = null;
+    }
 
-    // Incoming call
-    socket.on('incoming-call', async ({ from }) => {
-      const accept = confirm('Call from ' + from + ' – accept?');
-      if (!accept) return;
-      currentRemoteSocketId = from;
-      await startPeer(false, from); // initiator = false
+    function resetSession(sendToRemote = true) {
+      if (!currentSession) return;
+      const duration = stopTimerAndGetDuration();
+
+      if (sendToRemote && duration >= 0) {
+        socket.emit('session-ended', {
+          sessionId: currentSession.id,
+          toUserId: currentSession.partnerUserId,
+          type: currentSession.type,
+          durationMs: duration,
+        });
+      }
+
+      setStatus(
+        `Session ended. Type=${currentSession.type}, Duration=${formatDuration(duration)}`
+      );
+
+      resetMedia();
+      currentSession = null;
+    }
+
+    // Registration
+    socket.on('connect', () => {
+      setStatus('Socket connected: ' + socket.id);
+
+      const savedUserId = localStorage.getItem('p2pUserId');
+      const savedName = localStorage.getItem('p2pName');
+      if (savedName) {
+        nameInput.value = savedName;
+      }
+      if (savedName && savedUserId) {
+        socket.emit('register', { name: savedName, existingUserId: savedUserId }, (res) => {
+          if (res.ok) {
+            myUserId = res.userId;
+            myUserIdSpan.textContent = myUserId;
+            setStatus('Re-registered with existing ID.');
+          } else {
+            setStatus('Auto register failed: ' + res.error);
+          }
+        });
+      }
     });
 
-    // Signaling data receive
-    socket.on('signal', async ({ from, signal }) => {
-      if (!peer) {
-        // Safety: call start ஆகாத நேரமே signal வந்தால்
-        currentRemoteSocketId = from;
-        await startPeer(false, from);
+    registerBtn.onclick = () => {
+      const name = nameInput.value.trim();
+      if (!name) {
+        alert('உங்கள் பெயர் எழுதுங்கள்');
+        return;
       }
+      const existingUserId = localStorage.getItem('p2pUserId') || null;
+      socket.emit('register', { name, existingUserId }, (res) => {
+        if (!res.ok) {
+          alert('Register error: ' + res.error);
+          return;
+        }
+        myUserId = res.userId;
+        myUserIdSpan.textContent = myUserId;
+        localStorage.setItem('p2pUserId', myUserId);
+        localStorage.setItem('p2pName', name);
+        setStatus('Registered as ' + name + ' (' + myUserId + ')');
+      });
+    };
+
+    // Start session
+    function startSession(type) {
+      if (!myUserId) {
+        alert('முதலில் register செய்யுங்கள்.');
+        return;
+      }
+      if (currentSession) {
+        alert('Already in a session. முதலில் End Session அழுத்துங்கள்.');
+        return;
+      }
+      const targetId = targetUserIdInput.value.trim();
+      if (!targetId) {
+        alert('Target User ID தேவை.');
+        return;
+      }
+
+      socket.emit('request-session', { toUserId: targetId, type }, (res) => {
+        if (!res.ok) {
+          if (res.code === 'offline') {
+            setStatus('User offline.');
+          } else if (res.code === 'busy') {
+            setStatus('User busy (already in another session).');
+          } else {
+            setStatus('Request failed: ' + res.error);
+          }
+          return;
+        }
+        const sessionId = res.sessionId;
+        currentSession = {
+          id: sessionId,
+          type,
+          partnerUserId: targetId,
+          startTime: null,
+          timerInterval: null,
+        };
+        setStatus(`Session request sent (${type}) to ${targetId} (sessionId=${sessionId})`);
+
+        if (type === 'audio' || type === 'video') {
+          createPeer(true, type);
+        } else if (type === 'chat') {
+          // wait for answer, timer start then
+        }
+      });
+    }
+
+    btnChat.onclick = () => startSession('chat');
+    btnAudio.onclick = () => startSession('audio');
+    btnVideo.onclick = () => startSession('video');
+
+    btnEnd.onclick = () => {
+      resetSession(true);
+    };
+
+    // Incoming session
+    socket.on('incoming-session', ({ sessionId, fromUserId, type }) => {
+      // Busy check at client side (optional)
+      if (currentSession) {
+        // already in session => reject
+        socket.emit('answer-session', {
+          sessionId,
+          toUserId: fromUserId,
+          type,
+          accept: false,
+        });
+        setStatus(
+          `Received ${type} request from ${fromUserId}, but I am busy; auto-rejected.`
+        );
+        return;
+      }
+
+      const myId = myUserId;
+      if (!myId) {
+        setStatus('You are not registered; rejecting session.');
+        socket.emit('answer-session', {
+          sessionId,
+          toUserId: fromUserId,
+          type,
+          accept: false,
+        });
+        return;
+      }
+
+      const ok = confirm(`Incoming ${type} request from ${fromUserId}. Accept?`);
+
+      socket.emit('answer-session', {
+        sessionId,
+        toUserId: fromUserId,
+        type,
+        accept: ok,
+      });
+
+      if (!ok) {
+        setStatus(`Rejected ${type} session from ${fromUserId}`);
+        return;
+      }
+
+      currentSession = {
+        id: sessionId,
+        type,
+        partnerUserId: fromUserId,
+        startTime: null,
+        timerInterval: null,
+      };
+      setStatus(`Accepted ${type} session from ${fromUserId} (sessionId=${sessionId})`);
+
+      if (type === 'audio' || type === 'video') {
+        createPeer(false, type);
+      } else if (type === 'chat') {
+        startTimer();
+      }
+    });
+
+    // Answer from callee (for caller)
+    socket.on('session-answered', ({ sessionId, fromUserId, type, accept }) => {
+      if (!currentSession || currentSession.id !== sessionId) return;
+
+      if (!accept) {
+        setStatus(`${type} session rejected by ${fromUserId}`);
+        resetSession(false); // don't send session-ended to them, already reject செய்தாச்சு
+        return;
+      }
+
+      setStatus(`${type} session accepted by ${fromUserId}`);
+      if (type === 'chat') {
+        startTimer();
+      }
+      // audio/videoல் timer start happens on peer.connect
+    });
+
+    // WebRTC
+    async function createPeer(initiator, type) {
+      try {
+        if (type === 'audio' || type === 'video') {
+          const constraints = type === 'audio'
+            ? { audio: true, video: false }
+            : { audio: true, video: true };
+
+          localStream = await navigator.mediaDevices.getUserMedia(constraints);
+          localVideo.srcObject = localStream;
+        }
+
+        peer = new SimplePeer({
+          initiator,
+          trickle: false,
+          stream: localStream || undefined,
+        });
+
+        peer.on('signal', (data) => {
+          if (!currentSession) return;
+          socket.emit('signal', {
+            sessionId: currentSession.id,
+            toUserId: currentSession.partnerUserId,
+            signal: data,
+          });
+        });
+
+        peer.on('stream', (remoteStream) => {
+          remoteVideo.srcObject = remoteStream;
+        });
+
+        peer.on('connect', () => {
+          setStatus('WebRTC connected (' + currentSession.type + ')');
+          startTimer();
+        });
+
+        peer.on('error', (err) => {
+          console.error('Peer error:', err);
+          setStatus('Peer error: ' + err.message);
+        });
+
+        peer.on('close', () => {
+          console.log('Peer closed');
+        });
+      } catch (err) {
+        console.error('createPeer error', err);
+        alert('Media error: ' + err.message);
+      }
+    }
+
+    socket.on('signal', ({ sessionId, fromUserId, signal }) => {
+      if (!currentSession || currentSession.id !== sessionId) return;
+      if (!peer) return;
       peer.signal(signal);
     });
 
-    async function startPeer(initiator, remoteSocketId) {
-      try {
-        if (!localStream) {
-          localStream = await navigator.mediaDevices.getUserMedia({
-            video: true,
-            audio: true,
-          });
-          localVideo.srcObject = localStream;
-        }
-      } catch (err) {
-        console.error('getUserMedia error', err);
-        alert('Camera / Mic access இல்லை / block ஆகியிருக்கும்.');
+    // Chat via Socket.IO
+    function addChatLine(text, isMe, timestamp) {
+      const div = document.createElement('div');
+      const cls = isMe ? 'chat-me' : 'chat-other';
+      const timeStr = timestamp ? new Date(timestamp).toLocaleTimeString() : '';
+      div.innerHTML = `<span class="${cls}">[${timeStr}] ${text}</span>`;
+      chatBox.appendChild(div);
+      chatBox.scrollTop = chatBox.scrollHeight;
+    }
+
+    chatSendBtn.onclick = () => {
+      if (!currentSession || currentSession.type !== 'chat') {
+        alert('Chat session active இல்லை.');
         return;
       }
+      const text = chatInput.value.trim();
+      if (!text) return;
+      const toUserId = currentSession.partnerUserId;
+      const sessionId = currentSession.id;
+      const ts = Date.now();
 
-      if (peer) {
-        peer.destroy();
-        peer = null;
+      socket.emit('chat-message', {
+        toUserId,
+        text,
+        sessionId,
+        timestamp: ts,
+      });
+
+      addChatLine('நான்: ' + text, true, ts);
+      chatInput.value = '';
+    };
+
+    socket.on('chat-message', ({ fromUserId, text, sessionId, timestamp }) => {
+      // same sessionஆ என்றால் மட்டும் show
+      if (!currentSession || currentSession.id !== sessionId) return;
+      addChatLine(fromUserId + ': ' + text, false, timestamp);
+    });
+
+    // Session ended from remote
+    socket.on('session-ended', ({ sessionId, fromUserId, type, durationMs }) => {
+      if (!currentSession || currentSession.id !== sessionId) return;
+
+      stopTimerAndGetDuration();
+      const d = durationMs || 0;
+      setStatus(
+        `Session ended by ${fromUserId}. Type=${type}, Duration=${formatDuration(d)}`
+      );
+      resetMedia();
+      currentSession = null;
+    });
+
+    // Chat Enter shortcut
+    chatInput.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') {
+        chatSendBtn.click();
       }
-
-      peer = new SimplePeer({
-        initiator,
-        trickle: false,
-        stream: localStream,
-      });
-
-      peer.on('signal', (data) => {
-        if (!remoteSocketId) return;
-        socket.emit('signal', {
-          to: remoteSocketId,
-          signal: data,
-        });
-      });
-
-      peer.on('stream', (remoteStream) => {
-        console.log('Remote stream received');
-        remoteVideo.srcObject = remoteStream;
-      });
-
-      peer.on('error', (err) => {
-        console.error('Peer error:', err);
-      });
-
-      peer.on('close', () => {
-        console.log('Peer connection closed');
-      });
-    }
+    });
   </script>
 </body>
 </html>
