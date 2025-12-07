@@ -19,6 +19,7 @@
     #myUserId {
       font-weight: bold;
       color: #1b5e20;
+      word-break: break-all;
     }
     #status {
       margin-top: 8px;
@@ -26,6 +27,12 @@
       border: 1px solid #ccc;
       min-height: 30px;
       font-size: 14px;
+    }
+    #typingIndicator {
+      margin-top: 4px;
+      font-size: 13px;
+      color: #7b1fa2;
+      min-height: 18px;
     }
     #timer {
       font-weight: bold;
@@ -39,13 +46,27 @@
     #chatBox {
       border: 1px solid #ccc;
       padding: 8px;
-      height: 150px;
+      height: 200px;
       overflow-y: auto;
       font-size: 14px;
       margin-top: 8px;
     }
     .chat-me { color: #1b5e20; }
     .chat-other { color: #b71c1c; }
+    .chat-meta { font-size: 11px; color: #555; }
+    .chat-block { margin-bottom: 6px; }
+    img.chat-image {
+      max-width: 150px;
+      max-height: 150px;
+      display: block;
+      margin-top: 4px;
+      border: 1px solid #ccc;
+    }
+    audio { display: block; margin-top: 4px; }
+    .msg-status {
+      font-size: 11px;
+      margin-left: 6px;
+    }
   </style>
 </head>
 <body>
@@ -78,6 +99,7 @@
   <div class="row">
     Status:
     <div id="status"></div>
+    <div id="typingIndicator"></div>
   </div>
 
   <div class="row">
@@ -93,8 +115,13 @@
   <h3>Chat</h3>
   <div id="chatBox"></div>
   <div class="row">
-    <input id="chatInput" placeholder="செய்தி type செய்யுங்கள்" />
-    <button id="chatSendBtn">Send</button>
+    <input id="chatInput" placeholder="Text message type செய்யுங்கள்" />
+    <button id="chatSendBtn">Send Text</button>
+  </div>
+  <div class="row">
+    <button id="recordAudioBtn">🎙 Audio Record</button>
+    <input id="fileInput" type="file" />
+    <span class="chat-meta">Image / PDF / document upload செய்யலாம்</span>
   </div>
 
   <!-- Socket.IO client -->
@@ -115,6 +142,7 @@
     const btnEnd = document.getElementById('btnEnd');
 
     const statusDiv = document.getElementById('status');
+    const typingIndicator = document.getElementById('typingIndicator');
     const timerSpan = document.getElementById('timer');
 
     const localVideo = document.getElementById('localVideo');
@@ -124,10 +152,20 @@
     const chatInput = document.getElementById('chatInput');
     const chatSendBtn = document.getElementById('chatSendBtn');
 
+    const recordAudioBtn = document.getElementById('recordAudioBtn');
+    const fileInput = document.getElementById('fileInput');
+
     let myUserId = null;
     let currentSession = null; // { id, type, partnerUserId, startTime, timerInterval }
     let peer = null;
     let localStream = null;
+
+    let mediaRecorder = null;
+    let audioChunks = [];
+    let isRecording = false;
+
+    const msgStatusSpans = {}; // messageId -> span element
+    let typingTimeout = null;
 
     function setStatus(text) {
       statusDiv.textContent = text;
@@ -151,8 +189,7 @@
       timerSpan.textContent = '00:00';
       if (currentSession.timerInterval) clearInterval(currentSession.timerInterval);
       currentSession.timerInterval = setInterval(() => {
-        const now = Date.now();
-        const diff = now - currentSession.startTime;
+        const diff = Date.now() - currentSession.startTime;
         timerSpan.textContent = formatDuration(diff);
       }, 1000);
     }
@@ -203,7 +240,11 @@
       currentSession = null;
     }
 
-    // Registration
+    function makeMessageId() {
+      return 'm-' + Date.now() + '-' + Math.random().toString(36).slice(2);
+    }
+
+    // ===== Registration =====
     socket.on('connect', () => {
       setStatus('Socket connected: ' + socket.id);
 
@@ -245,7 +286,7 @@
       });
     };
 
-    // Start session
+    // ===== Start session =====
     function startSession(type) {
       if (!myUserId) {
         alert('முதலில் register செய்யுங்கள்.');
@@ -284,8 +325,6 @@
 
         if (type === 'audio' || type === 'video') {
           createPeer(true, type);
-        } else if (type === 'chat') {
-          // wait for answer, timer start then
         }
       });
     }
@@ -293,16 +332,11 @@
     btnChat.onclick = () => startSession('chat');
     btnAudio.onclick = () => startSession('audio');
     btnVideo.onclick = () => startSession('video');
+    btnEnd.onclick = () => resetSession(true);
 
-    btnEnd.onclick = () => {
-      resetSession(true);
-    };
-
-    // Incoming session
+    // ===== Incoming session =====
     socket.on('incoming-session', ({ sessionId, fromUserId, type }) => {
-      // Busy check at client side (optional)
       if (currentSession) {
-        // already in session => reject
         socket.emit('answer-session', {
           sessionId,
           toUserId: fromUserId,
@@ -357,13 +391,13 @@
       }
     });
 
-    // Answer from callee (for caller)
+    // ===== Answer for caller =====
     socket.on('session-answered', ({ sessionId, fromUserId, type, accept }) => {
       if (!currentSession || currentSession.id !== sessionId) return;
 
       if (!accept) {
         setStatus(`${type} session rejected by ${fromUserId}`);
-        resetSession(false); // don't send session-ended to them, already reject செய்தாச்சு
+        resetSession(false);
         return;
       }
 
@@ -371,10 +405,9 @@
       if (type === 'chat') {
         startTimer();
       }
-      // audio/videoல் timer start happens on peer.connect
     });
 
-    // WebRTC
+    // ===== WebRTC Audio/Video =====
     async function createPeer(initiator, type) {
       try {
         if (type === 'audio' || type === 'video') {
@@ -430,16 +463,66 @@
       peer.signal(signal);
     });
 
-    // Chat via Socket.IO
-    function addChatLine(text, isMe, timestamp) {
-      const div = document.createElement('div');
-      const cls = isMe ? 'chat-me' : 'chat-other';
-      const timeStr = timestamp ? new Date(timestamp).toLocaleTimeString() : '';
-      div.innerHTML = `<span class="${cls}">[${timeStr}] ${text}</span>`;
-      chatBox.appendChild(div);
+    // ===== Chat display helper =====
+    function addChatMessage(fromLabel, isMe, content, timestamp, messageId, initialStatus) {
+      const wrapper = document.createElement('div');
+      wrapper.className = 'chat-block';
+
+      const meta = document.createElement('div');
+      meta.className = 'chat-meta';
+      meta.textContent =
+        `[${new Date(timestamp).toLocaleTimeString()}] ` +
+        (isMe ? 'நான்' : fromLabel);
+      wrapper.appendChild(meta);
+
+      if (content.type === 'text') {
+        const span = document.createElement('div');
+        span.className = isMe ? 'chat-me' : 'chat-other';
+        span.textContent = content.text;
+        wrapper.appendChild(span);
+      } else if (content.type === 'audio') {
+        const info = document.createElement('div');
+        info.textContent = 'Audio message:';
+        wrapper.appendChild(info);
+        const audio = document.createElement('audio');
+        audio.controls = true;
+        audio.src = content.url;
+        wrapper.appendChild(audio);
+      } else if (content.type === 'file') {
+        const info = document.createElement('div');
+        info.textContent = 'File:';
+        wrapper.appendChild(info);
+
+        if (content.mimeType && content.mimeType.startsWith('image/')) {
+          const img = document.createElement('img');
+          img.src = content.url;
+          img.alt = content.name || 'image';
+          img.className = 'chat-image';
+          wrapper.appendChild(img);
+        } else {
+          const link = document.createElement('a');
+          link.href = content.url;
+          link.target = '_blank';
+          link.rel = 'noopener noreferrer';
+          link.textContent = content.name || 'Download file';
+          wrapper.appendChild(link);
+        }
+      }
+
+      if (isMe && messageId) {
+        const statusSpan = document.createElement('span');
+        statusSpan.className = 'msg-status';
+        statusSpan.textContent =
+          initialStatus === 'seen' ? '✓✓' : '✓'; // single tick
+        wrapper.appendChild(statusSpan);
+        msgStatusSpans[messageId] = statusSpan;
+      }
+
+      chatBox.appendChild(wrapper);
       chatBox.scrollTop = chatBox.scrollHeight;
     }
 
+    // ===== Text chat send =====
     chatSendBtn.onclick = () => {
       if (!currentSession || currentSession.type !== 'chat') {
         alert('Chat session active இல்லை.');
@@ -447,28 +530,191 @@
       }
       const text = chatInput.value.trim();
       if (!text) return;
+
       const toUserId = currentSession.partnerUserId;
       const sessionId = currentSession.id;
       const ts = Date.now();
+      const messageId = makeMessageId();
+      const content = { type: 'text', text };
 
       socket.emit('chat-message', {
         toUserId,
-        text,
         sessionId,
+        content,
         timestamp: ts,
+        messageId,
       });
 
-      addChatLine('நான்: ' + text, true, ts);
+      addChatMessage('நான்', true, content, ts, messageId, 'sent');
       chatInput.value = '';
     };
 
-    socket.on('chat-message', ({ fromUserId, text, sessionId, timestamp }) => {
-      // same sessionஆ என்றால் மட்டும் show
+    socket.on('chat-message', ({ fromUserId, content, sessionId, timestamp, messageId }) => {
       if (!currentSession || currentSession.id !== sessionId) return;
-      addChatLine(fromUserId + ': ' + text, false, timestamp);
+      addChatMessage(fromUserId, false, content, timestamp, null, null);
+
+      // இங்க வந்தவுடனே receiver -> sender க்கு "seen" send பண்ணுறோம்
+      socket.emit('message-delivered', {
+        toUserId: fromUserId,
+        messageId,
+      });
     });
 
-    // Session ended from remote
+    // ===== Tick (single/double) update =====
+    socket.on('message-status', ({ messageId, status }) => {
+      const span = msgStatusSpans[messageId];
+      if (!span) return;
+      if (status === 'sent') {
+        span.textContent = '✓';
+      } else if (status === 'seen') {
+        span.textContent = '✓✓';
+      }
+    });
+
+    // ===== Typing indicator =====
+    function sendTyping(isTyping) {
+      if (!currentSession || currentSession.type !== 'chat') return;
+      socket.emit('typing', {
+        toUserId: currentSession.partnerUserId,
+        isTyping,
+      });
+    }
+
+    chatInput.addEventListener('input', () => {
+      if (!currentSession || currentSession.type !== 'chat') return;
+      sendTyping(true);
+      if (typingTimeout) clearTimeout(typingTimeout);
+      typingTimeout = setTimeout(() => {
+        sendTyping(false);
+      }, 1200);
+    });
+
+    socket.on('typing', ({ fromUserId, isTyping }) => {
+      if (!currentSession || currentSession.partnerUserId !== fromUserId) return;
+      if (isTyping) {
+        typingIndicator.textContent = 'அவர்கள் typing…';
+      } else {
+        typingIndicator.textContent = '';
+      }
+    });
+
+    // ===== Chat enter key =====
+    chatInput.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        chatSendBtn.click();
+      }
+    });
+
+    // ===== Audio record & send =====
+    recordAudioBtn.onclick = async () => {
+      if (!currentSession || currentSession.type !== 'chat') {
+        alert('முதலில் chat session start செய்யுங்கள்.');
+        return;
+      }
+
+      if (!isRecording) {
+        try {
+          const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+          audioChunks = [];
+          mediaRecorder = new MediaRecorder(stream);
+
+          mediaRecorder.ondataavailable = (e) => {
+            if (e.data && e.data.size > 0) {
+              audioChunks.push(e.data);
+            }
+          };
+
+          mediaRecorder.onstop = async () => {
+            stream.getTracks().forEach((t) => t.stop());
+            const blob = new Blob(audioChunks, { type: 'audio/webm' });
+            const file = new File([blob], `audio-${Date.now()}.webm`, {
+              type: 'audio/webm',
+            });
+            await uploadAndSendFile(file, 'audio');
+            isRecording = false;
+            recordAudioBtn.textContent = '🎙 Audio Record';
+          };
+
+          mediaRecorder.start();
+          isRecording = true;
+          recordAudioBtn.textContent = '⏹ Stop Recording';
+        } catch (err) {
+          console.error('Audio record error:', err);
+          alert('Mic access error: ' + err.message);
+        }
+      } else {
+        if (mediaRecorder && mediaRecorder.state !== 'inactive') {
+          mediaRecorder.stop();
+        }
+      }
+    };
+
+    // ===== File upload =====
+    fileInput.onchange = async (e) => {
+      const file = e.target.files[0];
+      if (!file) return;
+      if (!currentSession || currentSession.type !== 'chat') {
+        alert('Chat session active இல்லை. முதலில் chat session start செய்யுங்கள்.');
+        fileInput.value = '';
+        return;
+      }
+
+      await uploadAndSendFile(file, 'file');
+      fileInput.value = '';
+    };
+
+    async function uploadAndSendFile(file, kind) {
+      try {
+        const fd = new FormData();
+        fd.append('file', file);
+
+        const res = await fetch('/upload', {
+          method: 'POST',
+          body: fd,
+        });
+        const json = await res.json();
+        if (!json.ok) {
+          alert('Upload failed: ' + json.error);
+          return;
+        }
+
+        const toUserId = currentSession.partnerUserId;
+        const sessionId = currentSession.id;
+        const ts = Date.now();
+        const messageId = makeMessageId();
+
+        const content =
+          kind === 'audio'
+            ? {
+                type: 'audio',
+                url: json.url,
+                mimeType: json.mimeType,
+                name: json.originalName,
+              }
+            : {
+                type: 'file',
+                url: json.url,
+                mimeType: json.mimeType,
+                name: json.originalName,
+              };
+
+        socket.emit('chat-message', {
+          toUserId,
+          sessionId,
+          content,
+          timestamp: ts,
+          messageId,
+        });
+
+        addChatMessage('நான்', true, content, ts, messageId, 'sent');
+      } catch (err) {
+        console.error('uploadAndSendFile error:', err);
+        alert('Upload error: ' + err.message);
+      }
+    }
+
+    // ===== Session ended from remote =====
     socket.on('session-ended', ({ sessionId, fromUserId, type, durationMs }) => {
       if (!currentSession || currentSession.id !== sessionId) return;
 
@@ -479,13 +725,6 @@
       );
       resetMedia();
       currentSession = null;
-    });
-
-    // Chat Enter shortcut
-    chatInput.addEventListener('keydown', (e) => {
-      if (e.key === 'Enter') {
-        chatSendBtn.click();
-      }
     });
   </script>
 </body>
