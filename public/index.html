@@ -27,6 +27,7 @@
       border: 1px solid #ccc;
       min-height: 30px;
       font-size: 14px;
+      white-space: pre-line;
     }
     #typingIndicator {
       margin-top: 4px;
@@ -124,9 +125,7 @@
     <span class="chat-meta">Image / PDF / document upload செய்யலாம்</span>
   </div>
 
-  <!-- Socket.IO client -->
   <script src="/socket.io/socket.io.js"></script>
-  <!-- Simple-peer -->
   <script src="https://unpkg.com/simple-peer/simplepeer.min.js"></script>
 
   <script>
@@ -156,7 +155,7 @@
     const fileInput = document.getElementById('fileInput');
 
     let myUserId = null;
-    let currentSession = null; // { id, type, partnerUserId, startTime, timerInterval }
+    let currentSession = null;
     let peer = null;
     let localStream = null;
 
@@ -164,11 +163,42 @@
     let audioChunks = [];
     let isRecording = false;
 
-    const msgStatusSpans = {}; // messageId -> span element
+    const msgStatusSpans = {};
     let typingTimeout = null;
+
+    // peer உருவாகும் முன் வரும் signaling messages queue
+    let pendingSignals = [];
+
+    // ExpressTurn STUN/TURN
+    const ICE_SERVERS = [
+  // Google STUN – சில browserக்கு safe fallback
+  { urls: 'stun:stun.l.google.com:19302' },
+
+  // ExpressTurn STUN
+  { urls: 'stun:relay1.expressturn.com:3478' },
+
+  // ExpressTurn TURN – UDP + TCP இரண்டையும் கொடுக்கிறோம்
+  {
+    urls: [
+      'turn:relay1.expressturn.com:3478?transport=udp',
+      'turn:relay1.expressturn.com:3478?transport=tcp'
+    ],
+    username: '000000002080531845',
+    credential: 'q4Z3wtKwfadKoxJ5dU7ghrlTmSc='
+  }
+];
+
+    function logDebug() {
+      console.log('[DEBUG]', ...arguments);
+    }
 
     function setStatus(text) {
       statusDiv.textContent = text;
+      console.log('[STATUS]', text);
+    }
+
+    function appendStatus(text) {
+      statusDiv.textContent += '\n' + text;
       console.log('[STATUS]', text);
     }
 
@@ -178,16 +208,25 @@
       const m = Math.floor((totalSeconds % 3600) / 60);
       const s = totalSeconds % 60;
       if (h > 0) {
-        return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
+        return (
+          String(h).padStart(2, '0') + ':' +
+          String(m).padStart(2, '0') + ':' +
+          String(s).padStart(2, '0')
+        );
       }
-      return `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
+      return (
+        String(m).padStart(2, '0') + ':' +
+        String(s).padStart(2, '0')
+      );
     }
 
     function startTimer() {
       if (!currentSession) return;
       currentSession.startTime = Date.now();
       timerSpan.textContent = '00:00';
-      if (currentSession.timerInterval) clearInterval(currentSession.timerInterval);
+      if (currentSession.timerInterval) {
+        clearInterval(currentSession.timerInterval);
+      }
       currentSession.timerInterval = setInterval(() => {
         const diff = Date.now() - currentSession.startTime;
         timerSpan.textContent = formatDuration(diff);
@@ -208,6 +247,7 @@
 
     function resetMedia() {
       if (peer) {
+        logDebug('Peer destroy() called');
         peer.destroy();
         peer = null;
       }
@@ -219,25 +259,28 @@
       remoteVideo.srcObject = null;
     }
 
-    function resetSession(sendToRemote = true) {
+    function resetSession(sendToRemote) {
       if (!currentSession) return;
       const duration = stopTimerAndGetDuration();
 
-      if (sendToRemote && duration >= 0) {
+      if (sendToRemote) {
         socket.emit('session-ended', {
           sessionId: currentSession.id,
           toUserId: currentSession.partnerUserId,
           type: currentSession.type,
-          durationMs: duration,
+          durationMs: duration
         });
       }
 
       setStatus(
-        `Session ended. Type=${currentSession.type}, Duration=${formatDuration(duration)}`
+        'Session ended. Type=' + currentSession.type +
+        ', Duration=' + formatDuration(duration)
       );
 
+      typingIndicator.textContent = '';
       resetMedia();
       currentSession = null;
+      pendingSignals = [];
     }
 
     function makeMessageId() {
@@ -254,15 +297,20 @@
         nameInput.value = savedName;
       }
       if (savedName && savedUserId) {
-        socket.emit('register', { name: savedName, existingUserId: savedUserId }, (res) => {
-          if (res.ok) {
-            myUserId = res.userId;
-            myUserIdSpan.textContent = myUserId;
-            setStatus('Re-registered with existing ID.');
-          } else {
-            setStatus('Auto register failed: ' + res.error);
+        logDebug('Auto-registering with saved ID', savedUserId);
+        socket.emit(
+          'register',
+          { name: savedName, existingUserId: savedUserId },
+          (res) => {
+            if (res.ok) {
+              myUserId = res.userId;
+              myUserIdSpan.textContent = myUserId;
+              setStatus('Re-registered with existing ID.');
+            } else {
+              setStatus('Auto register failed: ' + res.error);
+            }
           }
-        });
+        );
       }
     });
 
@@ -273,20 +321,25 @@
         return;
       }
       const existingUserId = localStorage.getItem('p2pUserId') || null;
-      socket.emit('register', { name, existingUserId }, (res) => {
-        if (!res.ok) {
-          alert('Register error: ' + res.error);
-          return;
+      logDebug('Manual register clicked. existingUserId =', existingUserId);
+      socket.emit(
+        'register',
+        { name: name, existingUserId: existingUserId },
+        (res) => {
+          if (!res.ok) {
+            alert('Register error: ' + res.error);
+            return;
+          }
+          myUserId = res.userId;
+          myUserIdSpan.textContent = myUserId;
+          localStorage.setItem('p2pUserId', myUserId);
+          localStorage.setItem('p2pName', name);
+          setStatus('Registered as ' + name + ' (' + myUserId + ')');
         }
-        myUserId = res.userId;
-        myUserIdSpan.textContent = myUserId;
-        localStorage.setItem('p2pUserId', myUserId);
-        localStorage.setItem('p2pName', name);
-        setStatus('Registered as ' + name + ' (' + myUserId + ')');
-      });
+      );
     };
 
-    // ===== Start session =====
+    // ===== Session start =====
     function startSession(type) {
       if (!myUserId) {
         alert('முதலில் register செய்யுங்கள்.');
@@ -302,8 +355,10 @@
         return;
       }
 
-      socket.emit('request-session', { toUserId: targetId, type }, (res) => {
+      logDebug('Requesting session', { type: type, to: targetId });
+      socket.emit('request-session', { toUserId: targetId, type: type }, (res) => {
         if (!res.ok) {
+          logDebug('request-session failed', res);
           if (res.code === 'offline') {
             setStatus('User offline.');
           } else if (res.code === 'busy') {
@@ -316,12 +371,16 @@
         const sessionId = res.sessionId;
         currentSession = {
           id: sessionId,
-          type,
+          type: type,
           partnerUserId: targetId,
           startTime: null,
-          timerInterval: null,
+          timerInterval: null
         };
-        setStatus(`Session request sent (${type}) to ${targetId} (sessionId=${sessionId})`);
+        pendingSignals = [];
+        setStatus(
+          'Session request sent (' + type + ') to ' +
+          targetId + ' (sessionId=' + sessionId + ')'
+        );
 
         if (type === 'audio' || type === 'video') {
           createPeer(true, type);
@@ -329,60 +388,72 @@
       });
     }
 
-    btnChat.onclick = () => startSession('chat');
-    btnAudio.onclick = () => startSession('audio');
-    btnVideo.onclick = () => startSession('video');
-    btnEnd.onclick = () => resetSession(true);
+    btnChat.onclick = function () { startSession('chat'); };
+    btnAudio.onclick = function () { startSession('audio'); };
+    btnVideo.onclick = function () { startSession('video'); };
+    btnEnd.onclick = function () { resetSession(true); };
 
     // ===== Incoming session =====
-    socket.on('incoming-session', ({ sessionId, fromUserId, type }) => {
+    socket.on('incoming-session', function (data) {
+      const sessionId = data.sessionId;
+      const fromUserId = data.fromUserId;
+      const type = data.type;
+
+      logDebug('incoming-session', data);
+
       if (currentSession) {
         socket.emit('answer-session', {
-          sessionId,
+          sessionId: sessionId,
           toUserId: fromUserId,
-          type,
-          accept: false,
+          type: type,
+          accept: false
         });
         setStatus(
-          `Received ${type} request from ${fromUserId}, but I am busy; auto-rejected.`
+          'Received ' + type + ' request from ' + fromUserId +
+          ', but I am busy; auto-rejected.'
         );
         return;
       }
 
-      const myId = myUserId;
-      if (!myId) {
+      if (!myUserId) {
         setStatus('You are not registered; rejecting session.');
         socket.emit('answer-session', {
-          sessionId,
+          sessionId: sessionId,
           toUserId: fromUserId,
-          type,
-          accept: false,
+          type: type,
+          accept: false
         });
         return;
       }
 
-      const ok = confirm(`Incoming ${type} request from ${fromUserId}. Accept?`);
+      var ok = confirm(
+        'Incoming ' + type + ' request from ' + fromUserId + '. Accept?'
+      );
 
       socket.emit('answer-session', {
-        sessionId,
+        sessionId: sessionId,
         toUserId: fromUserId,
-        type,
-        accept: ok,
+        type: type,
+        accept: ok
       });
 
       if (!ok) {
-        setStatus(`Rejected ${type} session from ${fromUserId}`);
+        setStatus('Rejected ' + type + ' session from ' + fromUserId);
         return;
       }
 
       currentSession = {
         id: sessionId,
-        type,
+        type: type,
         partnerUserId: fromUserId,
         startTime: null,
-        timerInterval: null,
+        timerInterval: null
       };
-      setStatus(`Accepted ${type} session from ${fromUserId} (sessionId=${sessionId})`);
+      pendingSignals = [];
+      setStatus(
+        'Accepted ' + type + ' session from ' + fromUserId +
+        ' (sessionId=' + sessionId + ')'
+      );
 
       if (type === 'audio' || type === 'video') {
         createPeer(false, type);
@@ -391,116 +462,187 @@
       }
     });
 
-    // ===== Answer for caller =====
-    socket.on('session-answered', ({ sessionId, fromUserId, type, accept }) => {
+    // ===== Answer (caller side) =====
+    socket.on('session-answered', function (data) {
+      const sessionId = data.sessionId;
+      const fromUserId = data.fromUserId;
+      const type = data.type;
+      const accept = data.accept;
+
+      logDebug('session-answered', data);
+
       if (!currentSession || currentSession.id !== sessionId) return;
 
       if (!accept) {
-        setStatus(`${type} session rejected by ${fromUserId}`);
+        setStatus(type + ' session rejected by ' + fromUserId);
         resetSession(false);
         return;
       }
 
-      setStatus(`${type} session accepted by ${fromUserId}`);
+      setStatus(type + ' session accepted by ' + fromUserId);
       if (type === 'chat') {
         startTimer();
       }
     });
 
-    // ===== WebRTC Audio/Video =====
+    // ===== WebRTC with ExpressTurn ICE =====
     async function createPeer(initiator, type) {
       try {
-        if (type === 'audio' || type === 'video') {
-          const constraints = type === 'audio'
-            ? { audio: true, video: false }
-            : { audio: true, video: true };
+        logDebug('createPeer called', {
+          initiator: initiator,
+          type: type,
+          ICE_SERVERS: ICE_SERVERS
+        });
 
+        if (type === 'audio' || type === 'video') {
+          var constraints =
+            type === 'audio'
+              ? { audio: true, video: false }
+              : { audio: true, video: true };
+
+          logDebug('Requesting getUserMedia', constraints);
           localStream = await navigator.mediaDevices.getUserMedia(constraints);
+          logDebug('getUserMedia success, stream tracks=', localStream.getTracks());
           localVideo.srcObject = localStream;
         }
 
         peer = new SimplePeer({
-          initiator,
-          trickle: false,
-          stream: localStream || undefined,
-        });
+  initiator: initiator,
+  trickle: false,
+  stream: localStream || undefined,
+  config: {
+    iceServers: ICE_SERVERS,
+    // எல்லா முடிச்சையும் browser decide பண்ணிடட்டும்
+    iceTransportPolicy: 'all'
+  }
+});
 
-        peer.on('signal', (data) => {
+        logDebug('SimplePeer created. Initiator =', initiator);
+
+        // pending signals flush
+        if (pendingSignals.length > 0) {
+          logDebug('Flushing pendingSignals', pendingSignals);
+          pendingSignals.forEach(function (sig) {
+            peer.signal(sig);
+          });
+          pendingSignals = [];
+        }
+
+        if (peer._pc) {
+          peer._pc.addEventListener('iceconnectionstatechange', function () {
+            var state = peer._pc.iceConnectionState;
+            logDebug('ICE state =', state);
+            appendStatus('ICE state: ' + state);
+          });
+
+          peer._pc.addEventListener('connectionstatechange', function () {
+            var state = peer._pc.connectionState;
+            logDebug('PC connectionState =', state);
+            appendStatus('PC connectionState: ' + state);
+          });
+        }
+
+        peer.on('signal', function (data) {
           if (!currentSession) return;
+          logDebug('peer signal', { hasSdp: !!data.sdp, type: data.type });
           socket.emit('signal', {
             sessionId: currentSession.id,
             toUserId: currentSession.partnerUserId,
-            signal: data,
+            signal: data
           });
         });
 
-        peer.on('stream', (remoteStream) => {
+        peer.on('stream', function (remoteStream) {
+          logDebug('peer remote stream event', remoteStream.getTracks());
           remoteVideo.srcObject = remoteStream;
         });
 
-        peer.on('connect', () => {
+        peer.on('connect', function () {
+          logDebug('peer CONNECT event fired');
           setStatus('WebRTC connected (' + currentSession.type + ')');
           startTimer();
         });
 
-        peer.on('error', (err) => {
+        peer.on('error', function (err) {
           console.error('Peer error:', err);
-          setStatus('Peer error: ' + err.message);
+          appendStatus('Peer error: ' + err.message);
         });
 
-        peer.on('close', () => {
-          console.log('Peer closed');
+        peer.on('close', function () {
+          logDebug('peer CLOSE event fired');
         });
       } catch (err) {
         console.error('createPeer error', err);
+        appendStatus('Media error: ' + err.message);
         alert('Media error: ' + err.message);
       }
     }
 
-    socket.on('signal', ({ sessionId, fromUserId, signal }) => {
-      if (!currentSession || currentSession.id !== sessionId) return;
-      if (!peer) return;
+    // ===== signaling from server → peer / queue =====
+    socket.on('signal', function (data) {
+      var sessionId = data.sessionId;
+      var fromUserId = data.fromUserId;
+      var signal = data.signal;
+
+      logDebug('signal from server', {
+        sessionId: sessionId,
+        fromUserId: fromUserId,
+        type: signal.type
+      });
+
+      if (!currentSession || currentSession.id !== sessionId) {
+        logDebug('signal dropped – no matching session');
+        return;
+      }
+
+      if (!peer) {
+        logDebug('peer is null – queuing signal');
+        pendingSignals.push(signal);
+        return;
+      }
+
+      logDebug('delivering signal to peer');
       peer.signal(signal);
     });
 
-    // ===== Chat display helper =====
+    // ===== Chat display =====
     function addChatMessage(fromLabel, isMe, content, timestamp, messageId, initialStatus) {
-      const wrapper = document.createElement('div');
+      var wrapper = document.createElement('div');
       wrapper.className = 'chat-block';
 
-      const meta = document.createElement('div');
+      var meta = document.createElement('div');
       meta.className = 'chat-meta';
       meta.textContent =
-        `[${new Date(timestamp).toLocaleTimeString()}] ` +
+        '[' + new Date(timestamp).toLocaleTimeString() + '] ' +
         (isMe ? 'நான்' : fromLabel);
       wrapper.appendChild(meta);
 
       if (content.type === 'text') {
-        const span = document.createElement('div');
+        var span = document.createElement('div');
         span.className = isMe ? 'chat-me' : 'chat-other';
         span.textContent = content.text;
         wrapper.appendChild(span);
       } else if (content.type === 'audio') {
-        const info = document.createElement('div');
-        info.textContent = 'Audio message:';
-        wrapper.appendChild(info);
-        const audio = document.createElement('audio');
+        var infoA = document.createElement('div');
+        infoA.textContent = 'Audio message:';
+        wrapper.appendChild(infoA);
+        var audio = document.createElement('audio');
         audio.controls = true;
         audio.src = content.url;
         wrapper.appendChild(audio);
       } else if (content.type === 'file') {
-        const info = document.createElement('div');
-        info.textContent = 'File:';
-        wrapper.appendChild(info);
+        var infoF = document.createElement('div');
+        infoF.textContent = 'File:';
+        wrapper.appendChild(infoF);
 
-        if (content.mimeType && content.mimeType.startsWith('image/')) {
-          const img = document.createElement('img');
+        if (content.mimeType && content.mimeType.indexOf('image/') === 0) {
+          var img = document.createElement('img');
           img.src = content.url;
           img.alt = content.name || 'image';
           img.className = 'chat-image';
           wrapper.appendChild(img);
         } else {
-          const link = document.createElement('a');
+          var link = document.createElement('a');
           link.href = content.url;
           link.target = '_blank';
           link.rel = 'noopener noreferrer';
@@ -510,10 +652,11 @@
       }
 
       if (isMe && messageId) {
-        const statusSpan = document.createElement('span');
+        var statusSpan = document.createElement('span');
         statusSpan.className = 'msg-status';
-        statusSpan.textContent =
-          initialStatus === 'seen' ? '✓✓' : '✓'; // single tick
+        if (initialStatus === 'queued') statusSpan.textContent = '…';
+        else if (initialStatus === 'seen') statusSpan.textContent = '✓✓';
+        else statusSpan.textContent = '✓';
         wrapper.appendChild(statusSpan);
         msgStatusSpans[messageId] = statusSpan;
       }
@@ -523,48 +666,64 @@
     }
 
     // ===== Text chat send =====
-    chatSendBtn.onclick = () => {
+    chatSendBtn.onclick = function () {
       if (!currentSession || currentSession.type !== 'chat') {
         alert('Chat session active இல்லை.');
         return;
       }
-      const text = chatInput.value.trim();
+      var text = chatInput.value.trim();
       if (!text) return;
 
-      const toUserId = currentSession.partnerUserId;
-      const sessionId = currentSession.id;
-      const ts = Date.now();
-      const messageId = makeMessageId();
-      const content = { type: 'text', text };
+      var toUserId = currentSession.partnerUserId;
+      var sessionId = currentSession.id;
+      var ts = Date.now();
+      var messageId = makeMessageId();
+      var content = { type: 'text', text: text };
 
       socket.emit('chat-message', {
-        toUserId,
-        sessionId,
-        content,
+        toUserId: toUserId,
+        sessionId: sessionId,
+        content: content,
         timestamp: ts,
-        messageId,
+        messageId: messageId
       });
 
       addChatMessage('நான்', true, content, ts, messageId, 'sent');
       chatInput.value = '';
+      sendTyping(false);
     };
 
-    socket.on('chat-message', ({ fromUserId, content, sessionId, timestamp, messageId }) => {
+    socket.on('chat-message', function (data) {
+      var fromUserId = data.fromUserId;
+      var content = data.content;
+      var sessionId = data.sessionId;
+      var timestamp = data.timestamp;
+      var messageId = data.messageId;
+
+      logDebug('chat-message received', {
+        fromUserId: fromUserId,
+        sessionId: sessionId,
+        messageId: messageId
+      });
+
       if (!currentSession || currentSession.id !== sessionId) return;
       addChatMessage(fromUserId, false, content, timestamp, null, null);
 
-      // இங்க வந்தவுடனே receiver -> sender க்கு "seen" send பண்ணுறோம்
       socket.emit('message-delivered', {
         toUserId: fromUserId,
-        messageId,
+        messageId: messageId
       });
     });
 
-    // ===== Tick (single/double) update =====
-    socket.on('message-status', ({ messageId, status }) => {
-      const span = msgStatusSpans[messageId];
+    // ===== Tick status =====
+    socket.on('message-status', function (data) {
+      var messageId = data.messageId;
+      var status = data.status;
+      var span = msgStatusSpans[messageId];
       if (!span) return;
-      if (status === 'sent') {
+      if (status === 'queued') {
+        span.textContent = '…';
+      } else if (status === 'sent') {
         span.textContent = '✓';
       } else if (status === 'seen') {
         span.textContent = '✓✓';
@@ -576,38 +735,37 @@
       if (!currentSession || currentSession.type !== 'chat') return;
       socket.emit('typing', {
         toUserId: currentSession.partnerUserId,
-        isTyping,
+        isTyping: isTyping
       });
     }
 
-    chatInput.addEventListener('input', () => {
+    chatInput.addEventListener('input', function () {
       if (!currentSession || currentSession.type !== 'chat') return;
       sendTyping(true);
       if (typingTimeout) clearTimeout(typingTimeout);
-      typingTimeout = setTimeout(() => {
+      typingTimeout = setTimeout(function () {
         sendTyping(false);
       }, 1200);
     });
 
-    socket.on('typing', ({ fromUserId, isTyping }) => {
-      if (!currentSession || currentSession.partnerUserId !== fromUserId) return;
-      if (isTyping) {
-        typingIndicator.textContent = 'அவர்கள் typing…';
-      } else {
-        typingIndicator.textContent = '';
-      }
+    socket.on('typing', function (data) {
+      var fromUserId = data.fromUserId;
+      var isTyping = data.isTyping;
+
+      if (!currentSession || currentSession.type !== 'chat') return;
+      if (currentSession.partnerUserId !== fromUserId) return;
+      typingIndicator.textContent = isTyping ? 'அவர்கள் typing…' : '';
     });
 
-    // ===== Chat enter key =====
-    chatInput.addEventListener('keydown', (e) => {
+    chatInput.addEventListener('keydown', function (e) {
       if (e.key === 'Enter') {
         e.preventDefault();
         chatSendBtn.click();
       }
     });
 
-    // ===== Audio record & send =====
-    recordAudioBtn.onclick = async () => {
+    // ===== Audio record & send (chat message) =====
+    recordAudioBtn.onclick = async function () {
       if (!currentSession || currentSession.type !== 'chat') {
         alert('முதலில் chat session start செய்யுங்கள்.');
         return;
@@ -615,22 +773,24 @@
 
       if (!isRecording) {
         try {
-          const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+          var stream = await navigator.mediaDevices.getUserMedia({ audio: true });
           audioChunks = [];
           mediaRecorder = new MediaRecorder(stream);
 
-          mediaRecorder.ondataavailable = (e) => {
+          mediaRecorder.ondataavailable = function (e) {
             if (e.data && e.data.size > 0) {
               audioChunks.push(e.data);
             }
           };
 
-          mediaRecorder.onstop = async () => {
-            stream.getTracks().forEach((t) => t.stop());
-            const blob = new Blob(audioChunks, { type: 'audio/webm' });
-            const file = new File([blob], `audio-${Date.now()}.webm`, {
-              type: 'audio/webm',
-            });
+          mediaRecorder.onstop = async function () {
+            stream.getTracks().forEach(function (t) { t.stop(); });
+            var blob = new Blob(audioChunks, { type: 'audio/webm' });
+            var file = new File(
+              [blob],
+              'audio-' + Date.now() + '.webm',
+              { type: 'audio/webm' }
+            );
             await uploadAndSendFile(file, 'audio');
             isRecording = false;
             recordAudioBtn.textContent = '🎙 Audio Record';
@@ -651,8 +811,8 @@
     };
 
     // ===== File upload =====
-    fileInput.onchange = async (e) => {
-      const file = e.target.files[0];
+    fileInput.onchange = async function (e) {
+      var file = e.target.files[0];
       if (!file) return;
       if (!currentSession || currentSession.type !== 'chat') {
         alert('Chat session active இல்லை. முதலில் chat session start செய்யுங்கள்.');
@@ -666,65 +826,78 @@
 
     async function uploadAndSendFile(file, kind) {
       try {
-        const fd = new FormData();
+        var fd = new FormData();
         fd.append('file', file);
 
-        const res = await fetch('/upload', {
+        var res = await fetch('/upload', {
           method: 'POST',
-          body: fd,
+          body: fd
         });
-        const json = await res.json();
+        var json = await res.json();
         if (!json.ok) {
           alert('Upload failed: ' + json.error);
           return;
         }
 
-        const toUserId = currentSession.partnerUserId;
-        const sessionId = currentSession.id;
-        const ts = Date.now();
-        const messageId = makeMessageId();
+        var toUserId = currentSession.partnerUserId;
+        var sessionId = currentSession.id;
+        var ts = Date.now();
+        var messageId = makeMessageId();
 
-        const content =
-          kind === 'audio'
-            ? {
-                type: 'audio',
-                url: json.url,
-                mimeType: json.mimeType,
-                name: json.originalName,
-              }
-            : {
-                type: 'file',
-                url: json.url,
-                mimeType: json.mimeType,
-                name: json.originalName,
-              };
+        var content;
+        if (kind === 'audio') {
+          content = {
+            type: 'audio',
+            url: json.url,
+            mimeType: json.mimeType,
+            name: json.originalName
+          };
+        } else {
+          content = {
+            type: 'file',
+            url: json.url,
+            mimeType: json.mimeType,
+            name: json.originalName
+          };
+        }
 
         socket.emit('chat-message', {
-          toUserId,
-          sessionId,
-          content,
+          toUserId: toUserId,
+          sessionId: sessionId,
+          content: content,
           timestamp: ts,
-          messageId,
+          messageId: messageId
         });
 
         addChatMessage('நான்', true, content, ts, messageId, 'sent');
       } catch (err) {
-        console.error('uploadAndSendFile error:', err);
+        console.error('uploadAndSendFile error', err);
         alert('Upload error: ' + err.message);
       }
     }
 
     // ===== Session ended from remote =====
-    socket.on('session-ended', ({ sessionId, fromUserId, type, durationMs }) => {
+    socket.on('session-ended', function (data) {
+      var sessionId = data.sessionId;
+      var fromUserId = data.fromUserId;
+      var type = data.type;
+      var durationMs = data.durationMs;
+
+      logDebug('session-ended (remote)', data);
+
       if (!currentSession || currentSession.id !== sessionId) return;
 
       stopTimerAndGetDuration();
-      const d = durationMs || 0;
+      var d = durationMs || 0;
       setStatus(
-        `Session ended by ${fromUserId}. Type=${type}, Duration=${formatDuration(d)}`
+        'Session ended by ' + fromUserId +
+        '. Type=' + type +
+        ', Duration=' + formatDuration(d)
       );
+      typingIndicator.textContent = '';
       resetMedia();
       currentSession = null;
+      pendingSignals = [];
     });
   </script>
 </body>
