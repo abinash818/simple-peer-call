@@ -57,6 +57,9 @@ const activeSessions = new Map();
 // userId -> sessionId
 const userActiveSession = new Map();
 
+// offline message queue: toUserId -> [ { fromUserId, content, sessionId, timestamp, messageId } ]
+const pendingMessages = new Map();
+
 function startSessionRecord(sessionId, type, u1, u2) {
   activeSessions.set(sessionId, {
     type,
@@ -77,6 +80,13 @@ function endSessionRecord(sessionId) {
       userActiveSession.delete(u);
     }
   });
+}
+
+function getOtherUserIdFromSession(sessionId, userId) {
+  const s = activeSessions.get(sessionId);
+  if (!s) return null;
+  const [u1, u2] = s.users;
+  return u1 === userId ? u2 : u2 === userId ? u1 : null;
 }
 
 // ===== Socket.IO =====
@@ -103,6 +113,31 @@ io.on('connection', (socket) => {
       console.log(
         `User registered: ${name} (${userId}) via socket ${socket.id}`
       );
+
+      // offline queue flush for this user
+      const queued = pendingMessages.get(userId);
+      if (queued && queued.length) {
+        console.log(`Delivering ${queued.length} queued messages to ${userId}`);
+        const targetSocketId = userSockets.get(userId);
+        queued.forEach((m) => {
+          if (!targetSocketId) return;
+          io.to(targetSocketId).emit('chat-message', {
+            fromUserId: m.fromUserId,
+            content: m.content,
+            sessionId: m.sessionId || null,
+            timestamp: m.timestamp,
+            messageId: m.messageId,
+          });
+          const senderSocketId = userSockets.get(m.fromUserId);
+          if (senderSocketId) {
+            io.to(senderSocketId).emit('message-status', {
+              messageId: m.messageId,
+              status: 'seen',
+            });
+          }
+        });
+        pendingMessages.delete(userId);
+      }
 
       cb({ ok: true, userId });
     } catch (err) {
@@ -137,7 +172,6 @@ io.on('connection', (socket) => {
         return cb({ ok: false, error: 'User offline', code: 'offline' });
       }
 
-      // Busy check
       if (userActiveSession.has(toUserId)) {
         return cb({ ok: false, error: 'User busy', code: 'busy' });
       }
@@ -212,7 +246,6 @@ io.on('connection', (socket) => {
   });
 
   // --- Chat message (text / audio / file) ---
-  // content: { type: 'text'|'audio'|'file', text?, url?, mimeType?, name? }
   socket.on('chat-message', (data) => {
     try {
       const { toUserId, sessionId, content, timestamp, messageId } = data || {};
@@ -220,15 +253,33 @@ io.on('connection', (socket) => {
       if (!fromUserId || !toUserId || !content || !messageId) return;
 
       const targetSocketId = userSockets.get(toUserId);
-      if (!targetSocketId) return;
 
-      // sender-க்கு single tick => sent
+      if (!targetSocketId) {
+        const list = pendingMessages.get(toUserId) || [];
+        list.push({
+          fromUserId,
+          content,
+          sessionId,
+          timestamp: timestamp || Date.now(),
+          messageId,
+        });
+        pendingMessages.set(toUserId, list);
+
+        socket.emit('message-status', {
+          messageId,
+          status: 'queued',
+        });
+        console.log(
+          `Queued message ${messageId} from ${fromUserId} to offline user ${toUserId}`
+        );
+        return;
+      }
+
       socket.emit('message-status', {
         messageId,
         status: 'sent',
       });
 
-      // receiver-க்கு message
       io.to(targetSocketId).emit('chat-message', {
         fromUserId,
         content,
@@ -251,10 +302,9 @@ io.on('connection', (socket) => {
       const targetSocketId = userSockets.get(toUserId);
       if (!targetSocketId) return;
 
-      // double tick => delivered/seen
       io.to(targetSocketId).emit('message-status', {
         messageId,
-        status: 'seen', // delivered/seen ஒன்றா வைத்திருக்கிறோம்
+        status: 'seen',
       });
     } catch (err) {
       console.error('message-delivered error', err);
@@ -280,7 +330,7 @@ io.on('connection', (socket) => {
     }
   });
 
-  // --- Session end ---
+  // --- Session end (manual) ---
   socket.on('session-ended', (data) => {
     try {
       const { sessionId, toUserId, type, durationMs } = data || {};
@@ -300,20 +350,44 @@ io.on('connection', (socket) => {
       }
 
       console.log(
-        `Session ended: sessionId=${sessionId}, type=${type}, from=${fromUserId}, to=${toUserId}, duration=${durationMs} ms`
+        `Session ended (manual): sessionId=${sessionId}, type=${type}, from=${fromUserId}, to=${toUserId}, duration=${durationMs} ms`
       );
     } catch (err) {
       console.error('session-ended error', err);
     }
   });
 
+  // --- Disconnect: auto end session on other side too ---
   socket.on('disconnect', () => {
     const userId = socketToUser.get(socket.id);
     if (userId) {
       console.log(`Socket disconnected: ${socket.id}, userId=${userId}`);
       socketToUser.delete(socket.id);
       const sid = userActiveSession.get(userId);
-      endSessionRecord(sid);
+      if (sid) {
+        const s = activeSessions.get(sid);
+        const otherUserId = getOtherUserIdFromSession(sid, userId);
+        const sessionType = s ? s.type : 'unknown';
+        const durationMs = s ? Date.now() - s.startedAt : 0;
+
+        endSessionRecord(sid);
+
+        if (otherUserId) {
+          const targetSocketId = userSockets.get(otherUserId);
+          if (targetSocketId) {
+            io.to(targetSocketId).emit('session-ended', {
+              sessionId: sid,
+              fromUserId: userId,
+              type: sessionType,
+              durationMs,
+            });
+          }
+        }
+
+        console.log(
+          `Session auto-ended due to disconnect: sessionId=${sid}, fromUserId=${userId}, otherUser=${otherUserId}`
+        );
+      }
     } else {
       console.log('Socket disconnected (no user):', socket.id);
     }
